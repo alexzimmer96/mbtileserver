@@ -4,20 +4,19 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
 	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
-
-	"net"
-	"net/http"
-	"net/url"
-	"os"
-	"time"
 
 	"github.com/labstack/echo/v4"
 
@@ -26,7 +25,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
-	mbtiles "github.com/brendan-ward/mbtiles-go"
+	"github.com/brendan-ward/mbtiles-go"
 	"github.com/consbio/mbtileserver/handlers"
 )
 
@@ -69,6 +68,7 @@ var (
 	port                int
 	tilePath            string
 	certificate         string
+	cacheHeader         string
 	privateKey          string
 	rootURLStr          string
 	domain              string
@@ -90,10 +90,34 @@ var (
 func init() {
 	flags := rootCmd.Flags()
 	flags.StringVar(&host, "host", "0.0.0.0", "IP address to listen on. Default is all interfaces.")
-	flags.IntVarP(&port, "port", "p", -1, "Server port. Default is 443 if --cert or --tls options are used, otherwise 8000.")
-	flags.StringVarP(&tilePath, "dir", "d", "./tilesets", "Directory containing mbtiles files.  Can be a comma-delimited list of directories.")
-	flags.BoolVarP(&generateIDs, "generate-ids", "", false, "Automatically generate tileset IDs instead of using relative path")
-	flags.StringVarP(&certificate, "cert", "c", "", "X.509 TLS certificate filename.  If present, will be used to enable SSL on the server.")
+	flags.IntVarP(
+		&port,
+		"port",
+		"p",
+		-1,
+		"Server port. Default is 443 if --cert or --tls options are used, otherwise 8000.",
+	)
+	flags.StringVarP(
+		&tilePath,
+		"dir",
+		"d",
+		"./tilesets",
+		"Directory containing mbtiles files.  Can be a comma-delimited list of directories.",
+	)
+	flags.BoolVarP(
+		&generateIDs,
+		"generate-ids",
+		"",
+		false,
+		"Automatically generate tileset IDs instead of using relative path",
+	)
+	flags.StringVarP(
+		&certificate,
+		"cert",
+		"c",
+		"",
+		"X.509 TLS certificate filename.  If present, will be used to enable SSL on the server.",
+	)
 	flags.StringVarP(&privateKey, "key", "k", "", "TLS private key")
 	flags.StringVar(&rootURLStr, "root-url", "/services", "Root URL of services endpoint")
 	flags.StringVar(&domain, "domain", "", "Domain name of this server.  NOTE: only used for AutoTLS.")
@@ -102,13 +126,56 @@ func init() {
 	flags.BoolVarP(&redirect, "redirect", "r", false, "Redirect HTTP to HTTPS")
 
 	flags.BoolVarP(&enableArcGIS, "enable-arcgis", "", false, "Enable ArcGIS Mapserver endpoints")
-	flags.BoolVarP(&enableReloadFSWatch, "enable-fs-watch", "", false, "Enable reloading of tilesets by watching filesystem")
-	flags.BoolVarP(&enableReloadSignal, "enable-reload-signal", "", false, "Enable graceful reload using HUP signal to the server process")
+	flags.BoolVarP(
+		&enableReloadFSWatch,
+		"enable-fs-watch",
+		"",
+		false,
+		"Enable reloading of tilesets by watching filesystem",
+	)
+	flags.BoolVarP(
+		&enableReloadSignal,
+		"enable-reload-signal",
+		"",
+		false,
+		"Enable graceful reload using HUP signal to the server process",
+	)
+	flags.StringVarP(
+		&cacheHeader,
+		"cache-header",
+		"",
+		"",
+		"Content of the Cache-Control HTTP Header. Skipped if empty.",
+	)
 
-	flags.BoolVarP(&disablePreview, "disable-preview", "", false, "Disable map preview for each tileset (enabled by default)")
-	flags.BoolVarP(&disableTileJSON, "disable-tilejson", "", false, "Disable TileJSON endpoint for each tileset (enabled by default)")
-	flags.BoolVarP(&disableServiceList, "disable-svc-list", "", false, "Disable services list endpoint (enabled by default)")
-	flags.BoolVarP(&tilesOnly, "tiles-only", "", false, "Only enable tile endpoints (shortcut for --disable-svc-list --disable-tilejson --disable-preview)")
+	flags.BoolVarP(
+		&disablePreview,
+		"disable-preview",
+		"",
+		false,
+		"Disable map preview for each tileset (enabled by default)",
+	)
+	flags.BoolVarP(
+		&disableTileJSON,
+		"disable-tilejson",
+		"",
+		false,
+		"Disable TileJSON endpoint for each tileset (enabled by default)",
+	)
+	flags.BoolVarP(
+		&disableServiceList,
+		"disable-svc-list",
+		"",
+		false,
+		"Disable services list endpoint (enabled by default)",
+	)
+	flags.BoolVarP(
+		&tilesOnly,
+		"tiles-only",
+		"",
+		false,
+		"Only enable tile endpoints (shortcut for --disable-svc-list --disable-tilejson --disable-preview)",
+	)
 
 	flags.StringVar(&sentryDSN, "dsn", "", "Sentry DSN")
 	flags.BoolVarP(&verbose, "verbose", "v", false, "Verbose logging")
@@ -152,8 +219,13 @@ func init() {
 	if env := os.Getenv("DOMAIN"); env != "" {
 		domain = env
 	}
+
 	if secretKey == "" {
 		secretKey = os.Getenv("HMAC_SECRET_KEY")
+	}
+
+	if env := os.Getenv("CACHE_HEADER"); env != "" {
+		cacheHeader = env
 	}
 
 	if env := os.Getenv("AUTO_TLS"); env != "" {
@@ -221,12 +293,14 @@ func serve() {
 	}
 
 	if len(sentryDSN) > 0 {
-		hook, err := logrus_sentry.NewSentryHook(sentryDSN, []log.Level{
-			log.PanicLevel,
-			log.FatalLevel,
-			log.ErrorLevel,
-			log.WarnLevel,
-		})
+		hook, err := logrus_sentry.NewSentryHook(
+			sentryDSN, []log.Level{
+				log.PanicLevel,
+				log.FatalLevel,
+				log.ErrorLevel,
+				log.WarnLevel,
+			},
+		)
 		if err != nil {
 			log.Fatalln(err)
 		}
@@ -285,14 +359,17 @@ func serve() {
 		}
 	}
 
-	svcSet, err := handlers.New(&handlers.ServiceSetConfig{
-		RootURL:           rootURL,
-		ErrorWriter:       &errorLogger{log: log.New()},
-		EnableServiceList: !disableServiceList,
-		EnableTileJSON:    !disableTileJSON,
-		EnablePreview:     !disablePreview,
-		EnableArcGIS:      enableArcGIS,
-	})
+	svcSet, err := handlers.New(
+		&handlers.ServiceSetConfig{
+			RootURL:           rootURL,
+			ErrorWriter:       &errorLogger{log: log.New()},
+			EnableServiceList: !disableServiceList,
+			EnableTileJSON:    !disableTileJSON,
+			EnablePreview:     !disablePreview,
+			EnableArcGIS:      enableArcGIS,
+			CacheHeader:       cacheHeader,
+		},
+	)
 	if err != nil {
 		log.Fatalln("Could not construct ServiceSet")
 	}

@@ -19,6 +19,7 @@ type ServiceSetConfig struct {
 	EnableArcGIS      bool
 	RootURL           *url.URL
 	ErrorWriter       io.Writer
+	CacheHeader       string
 }
 
 // ServiceSet is a group of tilesets plus configuration options.
@@ -30,6 +31,7 @@ type ServiceSet struct {
 	enableTileJSON    bool
 	enablePreview     bool
 	enableArcGIS      bool
+	cacheHeader       string
 
 	domain      string
 	rootURL     *url.URL
@@ -52,6 +54,7 @@ func New(cfg *ServiceSetConfig) (*ServiceSet, error) {
 		enableArcGIS:      cfg.EnableArcGIS,
 		rootURL:           cfg.RootURL,
 		errorWriter:       cfg.ErrorWriter,
+		cacheHeader:       cfg.CacheHeader,
 	}
 
 	return s, nil
@@ -182,11 +185,13 @@ func (s *ServiceSet) serviceListHandler(w http.ResponseWriter, r *http.Request) 
 
 	for _, id := range ids {
 		ts := s.tilesets[id]
-		services = append(services, ServiceInfo{
-			ImageType: ts.tileFormatString(),
-			URL:       fmt.Sprintf("%s/%s", rootURL, id),
-			Name:      ts.name,
-		})
+		services = append(
+			services, ServiceInfo{
+				ImageType: ts.tileFormatString(),
+				URL:       fmt.Sprintf("%s/%s", rootURL, id),
+				Name:      ts.name,
+			},
+		)
 	}
 	bytes, err := json.Marshal(services)
 	if err != nil {

@@ -11,20 +11,21 @@ import (
 	"syscall"
 	"time"
 
-	mbtiles "github.com/brendan-ward/mbtiles-go"
+	"github.com/brendan-ward/mbtiles-go"
 )
 
 // Tileset provides a tileset constructed from an mbtiles file
 type Tileset struct {
-	svc        *ServiceSet
-	db         *mbtiles.MBtiles
-	id         string
-	name       string
-	tileformat mbtiles.TileFormat
-	tilesize   uint32
-	published  bool
-	locked     bool
-	router     *http.ServeMux
+	svc         *ServiceSet
+	db          *mbtiles.MBtiles
+	id          string
+	name        string
+	tileformat  mbtiles.TileFormat
+	tilesize    uint32
+	published   bool
+	locked      bool
+	router      *http.ServeMux
+	cacheHeader string
 }
 
 // newTileset constructs a new Tileset from an mbtiles filename.
@@ -47,13 +48,14 @@ func newTileset(svc *ServiceSet, filename, id, path string) (*Tileset, error) {
 	}
 
 	ts := &Tileset{
-		svc:        svc,
-		db:         db,
-		id:         id,
-		name:       name,
-		tileformat: db.GetTileFormat(),
-		tilesize:   db.GetTileSize(),
-		published:  true,
+		svc:         svc,
+		db:          db,
+		id:          id,
+		name:        name,
+		tileformat:  db.GetTileFormat(),
+		tilesize:    db.GetTileSize(),
+		published:   true,
+		cacheHeader: svc.cacheHeader,
 	}
 
 	// setup routes for tileset
@@ -251,7 +253,14 @@ func (ts *Tileset) tileHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		ts.svc.logError("cannot fetch tile from DB for z=%d, x=%d, y=%d at path %v: %v", tc.z, tc.x, tc.y, r.URL.Path, err)
+		ts.svc.logError(
+			"cannot fetch tile from DB for z=%d, x=%d, y=%d at path %v: %v",
+			tc.z,
+			tc.x,
+			tc.y,
+			r.URL.Path,
+			err,
+		)
 		return
 	}
 	if data == nil || len(data) <= 1 {
@@ -262,6 +271,10 @@ func (ts *Tileset) tileHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", db.GetTileFormat().MimeType())
 	if db.GetTileFormat() == mbtiles.PBF {
 		w.Header().Set("Content-Encoding", "gzip")
+	}
+
+	if len(ts.cacheHeader) > 0 {
+		w.Header().Set("Cache-Control", ts.cacheHeader)
 	}
 
 	_, err = w.Write(data)
